@@ -6,7 +6,7 @@ from urllib.parse import urlparse
 import pandas as pd
 import streamlit as st
 
-from app.config import APP_PASSWORD, ASKEVA_TEMPLATE
+from app import config
 from app.db import db, init_db, list_clubs, list_jobs, list_logs, list_members, member_counts
 from app.importer import import_excel
 from app.phones import normalize_in_mobile
@@ -14,6 +14,8 @@ from app.sender import queue_job, run_job, save_pdf, setup_status
 
 SEED_XLSX = Path("/Users/vivek/Downloads/Rotary Members List.xlsx")
 MONTHS = list(month_name)[1:]
+
+config.reload()
 
 
 def bootstrap():
@@ -27,6 +29,8 @@ def bootstrap():
 bootstrap()
 
 st.set_page_config(page_title="RID 3206 Monthly Report", layout="wide")
+config.reload()
+config.apply_request_public_url()
 st.markdown(
     """
     <style>
@@ -47,7 +51,7 @@ def login_view():
         password = st.text_input("Password", type="password")
         submitted = st.form_submit_button("Sign in")
     if submitted:
-        if password == APP_PASSWORD:
+        if password == config.APP_PASSWORD:
             st.session_state.auth = True
             st.rerun()
         st.error("Incorrect password")
@@ -106,15 +110,15 @@ def send_tab(clubs, status):
         f"**{club['club_name']} Club Report for {month_label}** is attached for your reference. "
         "It summarises the club’s activities, updates, and key outcomes during this period.\n\n"
         f"Thank you  \nRID 3206\n\n"
-        f"Template: `{ASKEVA_TEMPLATE}`"
+        f"Template: `{config.ASKEVA_TEMPLATE}`"
     )
 
     if not status["has_token"]:
-        st.warning("ASKEVA_TOKEN is empty. Add it to `.env` and restart before sending.")
+        st.warning("ASKEVA_TOKEN is empty. Set it in the Settings tab.")
     if status["public_url_is_local"]:
         st.warning(
             f"PDFs will be served from `{status['public_base_url']}`. AskEva cannot fetch localhost. "
-            "Set PUBLIC_BASE_URL to this machine’s public HTTPS address (or a Cloudflare tunnel URL) and restart."
+            "Set PUBLIC_BASE_URL in Settings to this machine’s public HTTPS address (or a Cloudflare tunnel URL)."
         )
 
     confirm = st.checkbox(
@@ -234,6 +238,51 @@ def logs_tab():
         st.caption("No message logs yet.")
 
 
+def settings_tab():
+    st.write(
+        "These values are saved to `.env` on this machine and used immediately, "
+        "except **PORT**, which needs an app restart."
+    )
+    if config.running_on_streamlit_cloud():
+        st.info(
+            "This app is on Streamlit Cloud. Settings here last until the app reboots. "
+            "For a lasting AskEva token and password, paste them in "
+            "[Streamlit secrets](https://share.streamlit.io) → this app → Settings → Secrets. "
+            "See `.streamlit/secrets.toml.example` in the repo."
+        )
+    if st.session_state.pop("env_saved", False):
+        st.success("Settings saved.")
+    current = config.values()
+    show = st.checkbox("Show secret values", value=False)
+    suffix = "show" if show else "hide"
+    with st.form("env_form"):
+        edits = {}
+        for key, label, kind in config.EDITABLE_FIELDS:
+            value = current.get(key, "")
+            widget_key = f"env_{key}_{suffix}"
+            if kind == "int":
+                edits[key] = str(
+                    st.number_input(label, min_value=0, value=int(value or 0), step=1, key=widget_key)
+                )
+            elif kind == "password":
+                edits[key] = st.text_input(
+                    label,
+                    value=value,
+                    type="default" if show else "password",
+                    key=widget_key,
+                )
+            else:
+                edits[key] = st.text_input(label, value=value, key=widget_key)
+        saved = st.form_submit_button("Save settings", type="primary")
+    if saved:
+        try:
+            config.save_env(edits)
+            st.session_state.env_saved = True
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+
+
 if not st.session_state.get("auth"):
     login_view()
     st.stop()
@@ -254,9 +303,11 @@ with top[1]:
 c1, c2, c3 = st.columns(3)
 c1.metric("Clubs", status["clubs"])
 c2.metric("Members", status["members"])
-c3.metric("Template", ASKEVA_TEMPLATE)
+c3.metric("Template", config.ASKEVA_TEMPLATE)
 
-send, members, reimport, logs = st.tabs(["Send report", "Members", "Re-import", "Send log"])
+send, members, reimport, logs, settings = st.tabs(
+    ["Send report", "Members", "Re-import", "Send log", "Settings"]
+)
 with send:
     send_tab(clubs, status)
 with members:
@@ -265,3 +316,5 @@ with reimport:
     import_tab()
 with logs:
     logs_tab()
+with settings:
+    settings_tab()

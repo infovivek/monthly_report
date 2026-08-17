@@ -6,3 +6,5 @@ __pycache__/
 data/
 static/media/
 graphify-out/
+.streamlit/secrets.toml
+

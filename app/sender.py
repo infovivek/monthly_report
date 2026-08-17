@@ -7,20 +7,14 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from .askeva import AskEvaError, build_payload, send_template
-from .config import (
-    ASKEVA_TOKEN,
-    MAX_PDF_MB,
-    PUBLIC_BASE_URL,
-    SEND_DELAY_MS,
-    STATIC_MEDIA_DIR,
-)
+from . import config
 from . import db as database
 from .db import db, utcnow
 from .phones import normalize_in_mobile
 
 
 def public_url_looks_local() -> bool:
-    host = urlparse(PUBLIC_BASE_URL).hostname or ""
+    host = urlparse(config.PUBLIC_BASE_URL).hostname or ""
     return host in {"127.0.0.1", "localhost", "0.0.0.0", "::1"}
 
 
@@ -28,25 +22,26 @@ def setup_status() -> dict:
     with db() as conn:
         counts = database.member_counts(conn)
     return {
-        "has_token": bool(ASKEVA_TOKEN),
-        "public_base_url": PUBLIC_BASE_URL,
+        "has_token": bool(config.ASKEVA_TOKEN),
+        "public_base_url": config.PUBLIC_BASE_URL,
         "public_url_is_local": public_url_looks_local(),
         "members": counts["members"],
         "clubs": counts["clubs"],
-        "delay_ms": SEND_DELAY_MS,
+        "delay_ms": config.SEND_DELAY_MS,
+        "template": config.ASKEVA_TEMPLATE,
     }
 
 
 def save_pdf(data: bytes, original_name: str) -> tuple[str, str, str]:
-    if len(data) > MAX_PDF_MB * 1024 * 1024:
-        raise ValueError(f"PDF is larger than {MAX_PDF_MB} MB")
+    if len(data) > config.MAX_PDF_MB * 1024 * 1024:
+        raise ValueError(f"PDF is larger than {config.MAX_PDF_MB} MB")
     if len(data) < 10:
         raise ValueError("PDF file is empty")
     file_id = secrets.token_urlsafe(16)
     filename = f"{file_id}.pdf"
-    stored = STATIC_MEDIA_DIR / filename
+    stored = config.STATIC_MEDIA_DIR / filename
     stored.write_bytes(data)
-    pdf_url = f"{PUBLIC_BASE_URL}/app/static/media/{filename}"
+    pdf_url = f"{config.PUBLIC_BASE_URL}/app/static/media/{filename}"
     display = Path(original_name or "club-report.pdf").name
     if not display.lower().endswith(".pdf"):
         display += ".pdf"
@@ -82,7 +77,7 @@ def run_job(job_id: int, on_progress=None) -> dict:
 
     sent = skipped = failed = 0
     fatal = None
-    delay = max(SEND_DELAY_MS, 0) / 1000.0
+    delay = max(config.SEND_DELAY_MS, 0) / 1000.0
     logs: list[dict] = []
 
     try:
