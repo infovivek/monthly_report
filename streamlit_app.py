@@ -8,11 +8,12 @@ import streamlit as st
 
 from app import config
 from app.db import db, init_db, list_clubs, list_jobs, list_logs, list_members, member_counts
-from app.importer import import_excel
+from app.importer import import_club_files, import_excel
 from app.phones import normalize_in_mobile
-from app.sender import queue_job, run_job, save_pdf, setup_status
+from app.sender import queue_job, run_all_clubs, run_job, save_pdf, setup_status
 
 SEED_XLSX = Path("/Users/vivek/Downloads/Rotary Members List.xlsx")
+SEED_FILES = Path("/Users/vivek/Desktop/file.xlsx")
 MONTHS = list(month_name)[1:]
 
 config.reload()
@@ -22,8 +23,11 @@ def bootstrap():
     init_db()
     with db() as conn:
         empty = member_counts(conn)["members"] == 0
+        files_empty = member_counts(conn).get("clubs_with_file", 0) == 0
     if empty and SEED_XLSX.exists():
         import_excel(SEED_XLSX)
+    if files_empty and SEED_FILES.exists():
+        import_club_files(SEED_FILES)
 
 
 bootstrap()
@@ -95,7 +99,13 @@ def send_tab(clubs, status):
     month_label = f"{month} {int(year)}"
 
     pdf = st.file_uploader("Club report PDF", type=["pdf"])
-    pdf_url_in = st.text_input("Or public PDF URL (optional)", placeholder="https://your-server/reports/club.pdf")
+    default_url = club.get("pdf_url") or ""
+    pdf_url_in = st.text_input(
+        "Or public PDF URL (optional)",
+        value=default_url,
+        placeholder="https://your-server/reports/club.pdf",
+        key=f"pdf_url_{club['club_no']}",
+    )
     st.caption("Each club has its own PDF. Every member of the selected club gets the same file.")
 
     with db() as conn:
@@ -176,6 +186,84 @@ def send_tab(clubs, status):
             )
 
 
+def auto_send_tab(clubs, status):
+    ready = [c for c in clubs if (c.get("pdf_url") or "").startswith("http") and int(c.get("sendable_count") or 0) > 0]
+    missing_file = [c for c in clubs if not (c.get("pdf_url") or "").startswith("http")]
+    no_members = [
+        c
+        for c in clubs
+        if (c.get("pdf_url") or "").startswith("http") and int(c.get("sendable_count") or 0) == 0
+    ]
+    sendable_people = sum(int(c.get("sendable_count") or 0) for c in ready)
+
+    month_col, year_col = st.columns(2)
+    month = month_col.selectbox("Month", MONTHS, index=MONTHS.index("July"), key="auto_month")
+    year = year_col.number_input(
+        "Year", min_value=2020, max_value=2100, value=datetime.now().year, step=1, key="auto_year"
+    )
+    month_label = f"{month} {int(year)}"
+
+    st.write(
+        f"Month **{month_label}** is used for every club. Each club’s members get only that club’s PDF URL."
+    )
+    st.caption(
+        f"{len(ready)} clubs ready · {sendable_people} sendable members · "
+        f"{len(missing_file)} clubs skipped (no file) · {len(no_members)} skipped (no valid mobile)"
+    )
+    if ready:
+        preview = [
+            {
+                "Club": c["club_name"],
+                "Sendable": int(c.get("sendable_count") or 0),
+                "PDF": c.get("pdf_url") or "",
+            }
+            for c in ready
+        ]
+        st.dataframe(pd.DataFrame(preview), use_container_width=True, hide_index=True)
+
+    if not status["has_token"]:
+        st.warning("ASKEVA_TOKEN is empty. Set it in the Settings tab.")
+    if missing_file:
+        st.caption("No file: " + ", ".join(c["club_name"] for c in missing_file))
+
+    confirm = st.checkbox(
+        f"Send the {month_label} report to {sendable_people} members across {len(ready)} clubs. "
+        "Invalid numbers will be skipped."
+    )
+    start = st.button("Start auto send", type="primary", disabled=not status["has_token"] or not ready)
+
+    if start:
+        if not confirm:
+            st.error("Tick the confirmation box before sending.")
+            return
+        club_line = st.empty()
+        progress = st.progress(0)
+        summary = st.empty()
+        table = st.empty()
+
+        def on_progress(info):
+            club_line.write(
+                f"Club {info['club_index']} / {info['club_total']}: **{info['club_name']}**"
+            )
+            overall = ((info["club_index"] - 1) + (info["sent"] + info["skipped"] + info["failed"]) / max(info["total"], 1)) / max(
+                info["club_total"], 1
+            )
+            progress.progress(min(overall, 1.0))
+            summary.write(
+                f"This club: sent {info['sent']} · skipped {info['skipped']} · failed {info['failed']} / {info['total']}"
+            )
+            logs = info.get("logs") or []
+            if logs:
+                table.dataframe(pd.DataFrame(logs[::-1][:80]), use_container_width=True, hide_index=True)
+
+        totals = run_all_clubs(month_label, on_progress=on_progress)
+        progress.progress(1.0)
+        st.success(
+            f"Finished all clubs: sent {totals['sent']}, skipped {totals['skipped']}, "
+            f"failed {totals['failed']} across {totals['clubs']} clubs."
+        )
+
+
 def members_tab(clubs):
     if not clubs:
         st.info("No members imported yet.")
@@ -190,12 +278,13 @@ def members_tab(clubs):
 
 
 def import_tab():
+    st.subheader("Members")
     st.write(
         "Re-import the Rotary members Excel. Existing people are updated (by Rotary ID, or club + mobile). "
         "New clubs and members are inserted. Nobody is deleted."
     )
     xlsx = st.file_uploader("Members list (.xlsx)", type=["xlsx", "xlsm"])
-    if st.button("Import", disabled=xlsx is None):
+    if st.button("Import members", disabled=xlsx is None):
         dest = Path("data") / f"import-{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.xlsx"
         dest.write_bytes(xlsx.getvalue())
         try:
@@ -205,6 +294,27 @@ def import_tab():
             return
         st.success(
             f"Imported: {result['inserted']} new, {result['updated']} updated, {result['unchanged']} unchanged."
+        )
+        st.json(result)
+        st.rerun()
+
+    st.subheader("Club PDF files")
+    st.write(
+        "Excel with club name in column A and public PDF URL in column B. "
+        "Matched to existing clubs by name. Members are not changed."
+    )
+    files_xlsx = st.file_uploader("Club files list (.xlsx)", type=["xlsx", "xlsm"], key="files_xlsx")
+    if st.button("Import club files", disabled=files_xlsx is None):
+        dest = Path("data") / f"club-files-{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}.xlsx"
+        dest.write_bytes(files_xlsx.getvalue())
+        try:
+            result = import_club_files(dest)
+        except Exception as exc:
+            st.error(str(exc))
+            return
+        st.success(
+            f"Club files: {result['updated']} updated, {result['unchanged']} already set, "
+            f"{result['unmatched']} unmatched names."
         )
         st.json(result)
         st.rerun()
@@ -300,14 +410,17 @@ with top[1]:
         st.session_state.clear()
         st.rerun()
 
-c1, c2, c3 = st.columns(3)
+c1, c2, c3, c4 = st.columns(4)
 c1.metric("Clubs", status["clubs"])
 c2.metric("Members", status["members"])
-c3.metric("Template", config.ASKEVA_TEMPLATE)
+c3.metric("Clubs with file", status.get("clubs_with_file", 0))
+c4.metric("Template", config.ASKEVA_TEMPLATE)
 
-send, members, reimport, logs, settings = st.tabs(
-    ["Send report", "Members", "Re-import", "Send log", "Settings"]
+auto, send, members, reimport, logs, settings = st.tabs(
+    ["Auto send", "Send one club", "Members", "Re-import", "Send log", "Settings"]
 )
+with auto:
+    auto_send_tab(clubs, status)
 with send:
     send_tab(clubs, status)
 with members:

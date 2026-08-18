@@ -106,6 +106,9 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_logs_status ON send_logs(status);
             """
         )
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(clubs)")}
+        if "pdf_url" not in cols:
+            conn.execute("ALTER TABLE clubs ADD COLUMN pdf_url TEXT")
 
 
 def row_to_dict(row: sqlite3.Row | None) -> dict | None:
@@ -117,7 +120,7 @@ def row_to_dict(row: sqlite3.Row | None) -> dict | None:
 def list_clubs(conn: sqlite3.Connection) -> list[dict]:
     rows = conn.execute(
         """
-        SELECT c.club_no, c.club_name,
+        SELECT c.club_no, c.club_name, c.pdf_url,
                COUNT(m.id) AS member_count,
                SUM(CASE WHEN m.mobile_digits IS NOT NULL AND length(m.mobile_digits)=10 THEN 1 ELSE 0 END) AS sendable_count
         FROM clubs c
@@ -131,7 +134,7 @@ def list_clubs(conn: sqlite3.Connection) -> list[dict]:
 
 def get_club(conn: sqlite3.Connection, club_no: str) -> dict | None:
     row = conn.execute(
-        "SELECT club_no, club_name FROM clubs WHERE club_no = ?", (club_no,)
+        "SELECT club_no, club_name, pdf_url FROM clubs WHERE club_no = ?", (club_no,)
     ).fetchone()
     return row_to_dict(row)
 
@@ -152,7 +155,10 @@ def list_members(conn: sqlite3.Connection, club_no: str) -> list[dict]:
 def member_counts(conn: sqlite3.Connection) -> dict:
     row = conn.execute("SELECT COUNT(*) AS n FROM members").fetchone()
     clubs = conn.execute("SELECT COUNT(*) AS n FROM clubs").fetchone()
-    return {"members": row["n"], "clubs": clubs["n"]}
+    with_file = conn.execute(
+        "SELECT COUNT(*) AS n FROM clubs WHERE pdf_url IS NOT NULL AND trim(pdf_url) != ''"
+    ).fetchone()
+    return {"members": row["n"], "clubs": clubs["n"], "clubs_with_file": with_file["n"]}
 
 
 def dumps(obj) -> str:

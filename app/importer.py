@@ -227,3 +227,85 @@ def import_excel(path: str | Path) -> dict:
         "skipped": skipped,
         "source": str(path),
     }
+
+
+CLUB_NAME_ALIASES = {
+    "coimbatore swasthik": "rotary club of coimbatore swasthik",
+}
+
+
+def _norm_club_name(name: str) -> str:
+    return " ".join((name or "").strip().split()).casefold()
+
+
+def _club_name_keys(name: str) -> list[str]:
+    key = _norm_club_name(name)
+    keys = [key]
+    if key in CLUB_NAME_ALIASES:
+        keys.append(CLUB_NAME_ALIASES[key])
+    if key.startswith("rotary club of "):
+        keys.append(key[len("rotary club of ") :])
+    else:
+        keys.append("rotary club of " + key)
+    seen = []
+    for item in keys:
+        if item and item not in seen:
+            seen.append(item)
+    return seen
+
+
+def import_club_files(path: str | Path) -> dict:
+    path = Path(path)
+    wb = load_workbook(path, read_only=True, data_only=True)
+    ws = wb[wb.sheetnames[0]]
+    mapped = unmatched = skipped = updated = unchanged = 0
+    now = utcnow()
+
+    with db() as conn:
+        clubs = conn.execute("SELECT club_no, club_name, pdf_url FROM clubs").fetchall()
+        by_key = {}
+        for club in clubs:
+            for key in _club_name_keys(club["club_name"]):
+                by_key.setdefault(key, club)
+
+        pending = {}
+        for row in ws.iter_rows(values_only=True):
+            name = clean(row[0] if row else None)
+            url = clean(row[1] if row and len(row) > 1 else None)
+            if not name and not url:
+                continue
+            if not name or not url:
+                skipped += 1
+                continue
+            if not url.startswith("http://") and not url.startswith("https://"):
+                skipped += 1
+                continue
+            club = None
+            for key in _club_name_keys(name):
+                club = by_key.get(key)
+                if club:
+                    break
+            if club is None:
+                unmatched += 1
+                continue
+            pending[club["club_no"]] = (club, url)
+
+        for club, url in pending.values():
+            mapped += 1
+            if (club["pdf_url"] or "") == url:
+                unchanged += 1
+                continue
+            conn.execute(
+                "UPDATE clubs SET pdf_url = ?, updated_at = ? WHERE club_no = ?",
+                (url, now, club["club_no"]),
+            )
+            updated += 1
+
+    return {
+        "mapped": mapped,
+        "updated": updated,
+        "unchanged": unchanged,
+        "unmatched": unmatched,
+        "skipped": skipped,
+        "source": str(path),
+    }

@@ -27,6 +27,7 @@ def setup_status() -> dict:
         "public_url_is_local": public_url_looks_local(),
         "members": counts["members"],
         "clubs": counts["clubs"],
+        "clubs_with_file": counts.get("clubs_with_file", 0),
         "delay_ms": config.SEND_DELAY_MS,
         "template": config.ASKEVA_TEMPLATE,
     }
@@ -234,3 +235,58 @@ def _bump(job_id, sent, skipped, failed):
             "UPDATE send_jobs SET sent = ?, skipped = ?, failed = ? WHERE id = ?",
             (sent, skipped, failed, job_id),
         )
+
+
+def filename_from_url(pdf_url: str, fallback: str = "club-report.pdf") -> str:
+    name = Path(urlparse(pdf_url).path).name or fallback
+    if not name.lower().endswith(".pdf"):
+        name += ".pdf"
+    return name
+
+
+def clubs_ready_to_send() -> list[dict]:
+    with db() as conn:
+        clubs = database.list_clubs(conn)
+    return [
+        c
+        for c in clubs
+        if (c.get("pdf_url") or "").startswith("http") and int(c.get("sendable_count") or 0) > 0
+    ]
+
+
+def run_all_clubs(month_label: str, on_progress=None) -> dict:
+    ready = clubs_ready_to_send()
+    totals = {"clubs": len(ready), "sent": 0, "skipped": 0, "failed": 0, "jobs": []}
+    for index, club in enumerate(ready, start=1):
+        pdf_url = club["pdf_url"]
+        display_name = filename_from_url(pdf_url, f"{club['club_name']}.pdf")
+        job_id, _club, _members = queue_job(
+            club_no=club["club_no"],
+            month_label=month_label,
+            pdf_url=pdf_url,
+            pdf_filename=display_name,
+            pdf_path=None,
+        )
+
+        def club_progress(sent, skipped_n, failed, total, logs, club=club, index=index, job_id=job_id):
+            if on_progress:
+                on_progress(
+                    {
+                        "club_index": index,
+                        "club_total": len(ready),
+                        "club_name": club["club_name"],
+                        "job_id": job_id,
+                        "sent": sent,
+                        "skipped": skipped_n,
+                        "failed": failed,
+                        "total": total,
+                        "logs": logs,
+                    }
+                )
+
+        job = run_job(job_id, on_progress=club_progress)
+        totals["sent"] += int(job.get("sent") or 0)
+        totals["skipped"] += int(job.get("skipped") or 0)
+        totals["failed"] += int(job.get("failed") or 0)
+        totals["jobs"].append(job)
+    return totals
